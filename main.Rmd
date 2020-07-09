@@ -1,0 +1,211 @@
+---
+title: "First Time Buyers"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Libraries
+```{r libraries, results='hide'}
+library(knitr)
+library(survival)
+library(rpart)
+library(dplyr)
+source("db.R")
+```
+
+## Data
+
+The table mart_ftb is a data mart designed for this project. It contains all first time orders since 01/01/2018.
+
+```{r readdata}
+# Read Data
+query <- 'select * from mart_ftb'
+data <- exeQueryString (query, stringsAsFactors = TRUE)
+```
+
+We define the data used for training our model and the data corresponding to first time customers that have not placed a second order yet.
+
+```{r datadef}
+data.train <- data
+data.score <- data[!is.na(data$IS_SCORE),]
+data.nm    <- data[!is.na(data$NET_MARGIN_FWD_90D),]
+```
+
+## Time-to-Event Modeling
+
+### Predicting the Propensity for additional purchases
+
+We fit the survival model. The column OUTCOME_TIME is the time between the first purchase and the subsequent event. The OUTCOME_CENSORED is a binary column indicating whether the second purchase has happened.
+
+```{r timetoevent1}
+surv <- Surv(time = data.train$OUTCOME_TIME, 
+            event = data.train$OUTCOME_CENSORED)
+```
+
+Fit the Cox proportional hazards model. We use a limited set of attributes to enhance the predictive power of the model.
+
+```{r timetoevent2}
+cox <- coxph(surv ~ QUARTER + 
+                    NEW_CHANNEL +
+                    USERGROUP_V2 +
+                    TIME_BETWEEN_REG_FIRST, data = data.train)
+cox
+```
+
+Using the fitted model we can predict the propensity of the Buyer converting in a given time period. Calculate the propensity to transact in the next 30 days. First we calculate the cumulative baseline hazard function.
+
+```{r timetoevent3}
+curve            <- basehaz(cox, centered=TRUE); names(curve) <- c("chaz", "time")
+head(curve)
+```
+
+Then we calculate the baseline 30, 60 and 90 day conversion propensity.
+
+```{r timetoevent4}
+curve            <- basehaz(cox, centered=TRUE); names(curve) <- c("chaz", "time")
+curve$haz        <- c(curve$chaz[1], diff(curve$chaz))
+curve$conv_30    <- 1 - exp(-lead(curve$chaz, 30)) - (1 - exp(-lead(curve$chaz, 0)))
+curve$conv_60    <- 1 - exp(-lead(curve$chaz, 60)) - (1 - exp(-lead(curve$chaz, 0)))
+curve$conv_90    <- 1 - exp(-lead(curve$chaz, 90)) - (1 - exp(-lead(curve$chaz, 0)))
+conversion <- function(time)
+{
+   if (time > 1000) (return (0.007422))
+   i = which(curve$time == time)
+   return(curve[i,]$conv_90)
+}
+head(curve)
+```
+
+Now we can use the baseline conversion to calculate the actual 90 day propensity conversion for each Buyer.
+
+```{r timetoevent5}
+data.score$baseline_hazard <- sapply(data.score$OUTCOME_TIME, conversion)
+data.score$risk            <- predict(cox, newdata = data.score, type = 'risk')
+data.score$score           <- data.score$baseline_hazard * data.score$risk
+```
+
+
+### Predicting the expected Net Margin
+
+Predict the expected Net Margin per Buyer
+
+```{r timetoevent6}
+linearMod <- lm(NET_MARGIN_FWD_90D ~ QUARTER + 
+                                     NEW_CHANNEL +
+                                     USERGROUP_V2 +
+                                     TIME_BETWEEN_REG_FIRST, data = data.nm)
+data.score$nm <- predict(linearMod, newdata = data.score)
+data.score$nm_pred <- data.score$score * data.score$nm
+```
+
+
+## Segment Buyers
+We segment the Buyers using a segmentation technique based on recursive partitioning. The technique suggests three segments.
+
+```{r timetoevent7}
+data.score     <- data.score[order(data.score$nm_pred),]
+data.score$rnk <- 1:nrow(data.score)
+fit <- rpart(formula = score ~ rnk, 
+                data = data.score, 
+             control = rpart.control(cp = 0.075), 
+              method = "anova"
+)
+fit
+
+i <- 63189; data.score[i,]$nm_pred;
+i <- 98325; data.score[i,]$nm_pred;
+
+tags <- c("1","2", "3")
+breaks <- c(0, 20.79, 57.44, 10000)
+data.score$bins <- cut(data.score$nm_pred, 
+                       breaks=breaks, 
+                       include.lowest=TRUE, 
+                       right=FALSE, 
+                       labels=tags
+)
+data.score <- data.score[!is.na(data.score$nm_pred),]
+aggregate(data.score$nm_pred, by=list(data.score$bins), FUN=mean)
+aggregate(data.score$nm_pred, by=list(data.score$bins), FUN=sum)
+
+t <- aggregate(data.score$nm_pred, by=list(data.score$bins), FUN=length)
+t
+t$x/sum(t$x)
+
+a <- sort(data.score$nm_pred); plot(a)
+abline(h = 20.79, col="blue")
+abline(h = 57.44, col="blue")
+```
+
+
+## Client Grouping
+
+```{r clientgrouping}
+library(rpart)
+data.score$CLIENT_ID <- as.factor(data.score$CLIENT_ID)
+
+mytree <- rpart(score ~ CLIENT_ID, 
+                data   = data.score, 
+                method = "anova"
+)
+
+
+data.score$client_group <- predict(mytree, data.score)
+```
+
+## Export Scores back into the Database
+
+The scores are attached to the data_score frame. It is exported locally into export.csv.
+
+```{r export}
+exp <- data.score[, c("CUSTOMER_ID", "CLIENT_ID", "score", "nm_pred", "bins", "client_group")]
+
+# Output data
+con <- openCon()
+sqlDrop(channel = con, 
+        sqtable = "mart_ftb_score", 
+        errors = FALSE)
+sqlSave(channel = con, 
+        dat =exp, 
+        tablename = "mart_ftb_score",
+        append   = FALSE,
+        rownames = FALSE, 
+        colnames = FALSE, 
+        verbose  = FALSE,
+        safer    = TRUE, 
+        addPK    = FALSE, 
+        fast     = TRUE, 
+        test     = FALSE, 
+        nastring = NULL
+        )
+close(con)
+```
+
+
+## Model Validation
+
+```{r validation}
+query <- 'select * from mart_ftb_test'
+data.test <- exeQueryString (query, stringsAsFactors = TRUE)
+
+data.test$baseline_hazard <- sapply(data.test$TEST_TIME, conversion)
+data.test$risk            <- predict(cox, newdata = data.test, type = 'risk')
+data.test$score           <- data.test$baseline_hazard * data.test$risk
+
+data.test$nm <- predict(linearMod, newdata = data.test)
+data.test$nm_pred <- data.test$score * data.test$nm
+
+data.test$validation <- ifelse(!is.na(data.test$TEST_DAYS_TO_EVENT) & data.test$TEST_DAYS_TO_EVENT <= 90, 1, 0)
+
+breaks <- seq(0, 1, 0.05)
+data.test$score_bins <- cut(data.test$score, 
+                            breaks=breaks, 
+                            include.lowest=TRUE, 
+                            right=FALSE 
+                            #labels=tags
+                            )
+
+aggregate(data.test$validation, by=list(data.test$score_bins), FUN=mean)
+```
